@@ -1,0 +1,166 @@
+name: Build ApexMath Debug APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Cache Gradle caches and wrapper
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', '**/libs.versions.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Install exact Gradle version from gradle-wrapper.properties
+        shell: bash
+        run: |
+          set -euo pipefail
+          WRAPPER_PROPS="gradle/wrapper/gradle-wrapper.properties"
+          if [ ! -f "$WRAPPER_PROPS" ]; then
+            echo "Missing $WRAPPER_PROPS"
+            exit 1
+          fi
+          DIST_URL=$(grep -E '^distributionUrl=' "$WRAPPER_PROPS" | head -n1 | cut -d'=' -f2- | tr -d '\r' | sed 's/\\:/:/g')
+          GRADLE_VERSION=$(echo "$DIST_URL" | sed -nE 's/.*gradle-([0-9]+(\.[0-9]+)*(-[a-zA-Z0-9]+)?)-(bin|all)\.zip/\1/p')
+          if [ -z "$GRADLE_VERSION" ]; then
+            echo "Could not parse Gradle version from distributionUrl: $DIST_URL"
+            exit 1
+          fi
+          echo "Detected Gradle version: $GRADLE_VERSION"
+          DOWNLOAD_URL="https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
+          INSTALL_DIR="$HOME/gradle-dist"
+          mkdir -p "$INSTALL_DIR"
+          curl -fsSL "$DOWNLOAD_URL" -o "$INSTALL_DIR/gradle.zip"
+          unzip -q -o "$INSTALL_DIR/gradle.zip" -d "$INSTALL_DIR"
+          GRADLE_BIN="$INSTALL_DIR/gradle-${GRADLE_VERSION}/bin/gradle"
+          if [ ! -x "$GRADLE_BIN" ]; then
+            chmod +x "$GRADLE_BIN" || true
+          fi
+          if [ ! -x "$GRADLE_BIN" ]; then
+            echo "Gradle executable not found at $GRADLE_BIN"
+            exit 1
+          fi
+          echo "$INSTALL_DIR/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
+          "$GRADLE_BIN" --version
+
+      - name: Configure Android SDK and licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          export ANDROID_HOME="$SDK_ROOT"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          mkdir -p "$SDK_ROOT/licenses"
+          printf "\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n" > "$SDK_ROOT/licenses/android-sdk-license"
+          printf "\n84831b9409646a918e30573bab4c9c91346d8abd\n" > "$SDK_ROOT/licenses/android-sdk-preview-license"
+          printf "\nd975f751698a77b662f1254ddbeed3901e976f5a\n" > "$SDK_ROOT/licenses/intel-android-extra-license"
+          printf "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a\n" > "$SDK_ROOT/licenses/google-gdk-license"
+
+          SDKMANAGER=""
+          if command -v sdkmanager >/dev/null 2>&1; then
+            SDKMANAGER="$(command -v sdkmanager)"
+          elif [ -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          fi
+
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+            "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "platform-tools" || true
+          else
+            echo "sdkmanager not found; relying on pre-installed SDK components in $SDK_ROOT"
+          fi
+
+      - name: Restore or generate debug keystore
+        # Note: debug.keystore.base64 can be supplied securely via the GitHub secret
+        # DEBUG_KEYSTORE_BASE64 or as a protected repository file (never commit production keys).
+        shell: bash
+        env:
+          DEBUG_KEYSTORE_B64_SECRET: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -n "${DEBUG_KEYSTORE_B64_SECRET:-}" ]; then
+            echo "$DEBUG_KEYSTORE_B64_SECRET" | base64 -d > debug.keystore
+            echo "Restored debug.keystore from GitHub secret."
+          elif [ -f "debug.keystore.base64" ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+            echo "Restored debug.keystore from debug.keystore.base64."
+          elif [ ! -f "debug.keystore" ]; then
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+            echo "Generated fallback debug.keystore via keytool."
+          fi
+
+      - name: Build ApexMath Debug APK
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle assembleDebug \
+            --no-daemon \
+            --console=plain \
+            --stacktrace \
+            -Dorg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8" \
+            -Dorg.gradle.workers.max=2 2>&1 | tee build.log
+          BUILD_STATUS=${PIPESTATUS[0]}
+          if [ "$BUILD_STATUS" -ne 0 ]; then
+            echo "=== Gradle Build Failed (Last 80 Lines) ==="
+            tail -n 80 build.log
+            {
+              echo "### Gradle Build Failure (Last 80 Lines)"
+              echo '```'
+              tail -n 80 build.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$BUILD_STATUS"
+          fi
+
+      - name: Upload Debug APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ApexMath-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (best-effort)
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="alpha-112626-build-${{ github.run_number }}"
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          if [ -f "$APK" ]; then
+            gh release create "$TAG" "$APK" \
+              --title "ApexMath Alpha-112626 (Build #${{ github.run_number }})" \
+              --notes "Automated debug APK build for ApexMath Alpha-112626."
+          fi

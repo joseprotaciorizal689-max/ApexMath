@@ -1,0 +1,6 @@
+{
+  "name": "ApexMath",
+  "description": "Offline-first engineering calculator, symbolic & numerical math engine, graphing tool, and interactive math tutor (Alpha-112626).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
